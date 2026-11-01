@@ -1,0 +1,273 @@
+name: Update NewSky traffic B
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: newsky-snapshots
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Build both snapshots (NewSky traffic B)
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import concurrent.futures
+          import json
+          import math
+          import random
+          import time
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from urllib.error import HTTPError, URLError
+          from urllib.request import Request, urlopen
+
+          API = 'https://newsky.app/api/airport/'
+          WORKERS = 16
+          RESERVE = 2
+          RETRIES = 4
+          SNAP = Path('snapshot.json')
+          PREV = Path('snapshot_prev.json')
+
+          def week(value):
+              return math.ceil(value / 4)
+
+          def headers_info(headers):
+              try:
+                  return {
+                      'limit': int(headers['X-Rate-Limit-Limit']),
+                      'remaining': int(headers['X-Rate-Limit-Remaining']),
+                      'reset': int(headers['X-Rate-Limit-Reset']),
+                  }
+              except (KeyError, ValueError, TypeError) as ex:
+                  raise RuntimeError('API did not return the expected X-Rate-Limit-* headers; stopping to avoid uncontrolled requests') from ex
+
+          def request_airport(icao):
+              url = API + icao
+              for attempt in range(RETRIES):
+                  req = Request(url, headers={
+                      'Accept': 'application/json',
+                      'User-Agent': 'UkraineNS-TrafficB-Exporter/1.0',
+                  })
+                  try:
+                      with urlopen(req, timeout=30) as response:
+                          data = json.load(response)
+                          limits = headers_info(response.headers)
+                          return ('ok', data, limits)
+                  except HTTPError as ex:
+                      if ex.code == 429:
+                          try:
+                              limits = headers_info(ex.headers)
+                          except RuntimeError:
+                              # Some servers omit quota headers on 429 responses.
+                              limits = {'limit': 200, 'remaining': 0, 'reset': int(time.time() + 60)}
+                          retry_after = ex.headers.get('Retry-After', '0')
+                          try:
+                              limits['reset'] = max(limits['reset'], int(time.time() + float(retry_after)))
+                          except ValueError:
+                              pass
+                          return ('limited', None, limits)
+                      if ex.code in (401, 403):
+                          raise RuntimeError(f'{icao}: HTTP {ex.code}. NewSky denied anonymous access; no snapshots changed') from ex
+                      if ex.code not in (408, 500, 502, 503, 504) or attempt + 1 == RETRIES:
+                          raise RuntimeError(f'{icao}: HTTP {ex.code}; no snapshots changed') from ex
+                  except (URLError, TimeoutError, ConnectionError, json.JSONDecodeError) as ex:
+                      if attempt + 1 == RETRIES:
+                          raise RuntimeError(f'{icao}: API/network error: {ex}; no snapshots changed') from ex
+                  time.sleep(min(2 ** attempt, 8) + random.uniform(0, .4))
+              raise RuntimeError(f'{icao}: all retries failed')
+
+          def pause_until(reset):
+              wait = max(1.0, reset - time.time() + 1.0)
+              print(f'API quota reached; waiting {wait:.1f}s for reset (no requests sent)', flush=True)
+              time.sleep(wait)
+
+          def take_probe(icao):
+              for _ in range(6):
+                  status, payload, limits = request_airport(icao)
+                  if status == 'ok':
+                      return payload, limits
+                  pause_until(limits['reset'])
+              raise RuntimeError(f'Cannot pass API rate limit for {icao}')
+
+          def airport_record(obj, icao, old):
+              if not isinstance(obj, dict) or obj.get('icao', '').upper() != icao:
+                  raise ValueError(f'{icao}: invalid API response or different ICAO')
+              traffic = obj.get('traffic') or {}
+              b = traffic.get('B')
+              if not isinstance(b, dict):
+                  raise ValueError(f'{icao}: traffic.B is missing')
+              location = obj.get('location') or {}
+              lat, lon = location.get('lat'), location.get('lon')
+              if any(isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) for x in (lat, lon)):
+                  raise ValueError(f'{icao}: invalid coordinates')
+              if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                  raise ValueError(f'{icao}: coordinates out of range')
+              result = {
+                  'icao': icao,
+                  'name': obj.get('name') or old.get('name') or icao,
+                  'city': obj.get('city') or old.get('city') or '',
+                  'country': obj.get('country') or old.get('country') or '',
+                  'lat': lat,
+                  'lon': lon,
+                  'is_ua': obj.get('countryCode') == 'UA' or bool(old.get('is_ua', False)),
+              }
+              for kind in ('pax', 'cargo'):
+                  block = b.get(kind)
+                  directions = block.get('directions') if isinstance(block, dict) else None
+                  if not isinstance(directions, list) or len(directions) != 12:
+                      raise ValueError(f'{icao}: B.{kind} must have exactly 12 directions')
+                  sectors = []
+                  for i, item in enumerate(directions):
+                      if not isinstance(item, dict):
+                          raise ValueError(f'{icao}: invalid B.{kind}[{i}]')
+                      c, n, bias = (item.get(x) for x in ('current', 'normal', 'bias'))
+                      if any(isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) for x in (c, n, bias)):
+                          raise ValueError(f'{icao}: invalid B.{kind}[{i}] values')
+                      if c < 0 or n < 0:
+                          raise ValueError(f'{icao}: negative B.{kind}[{i}] demand')
+                      sectors.append({'c': c, 'n': n, 'b': bias})
+                  result[kind] = {'sectors': sectors}
+              return result
+
+          def distance_bearing(a, b):
+              lat1, lat2 = math.radians(a['lat']), math.radians(b['lat'])
+              dlat = lat2 - lat1
+              dlon = math.radians(b['lon'] - a['lon'])
+              h = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+              nm = 3440.065 * 2 * math.asin(min(1, math.sqrt(max(0, h))))
+              y = math.sin(dlon) * math.cos(lat2)
+              x = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(dlon)
+              bearing = (math.degrees(math.atan2(y, x)) + 360) % 360
+              return nm, bearing
+
+          def sector(bearing):
+              return int((bearing + 15) // 30) % 12
+
+          def rebuild_routes(old_routes, by_icao):
+              # Preserve rostykk's original airport pairs: the source repo does not
+              # include its route-discovery algorithm. Recompute all demand data
+              # using fresh B sectors in both directions for each existing pair.
+              routes = []
+              for old in old_routes:
+                  src, dst, kind = old.get('from'), old.get('to'), old.get('kind')
+                  if src not in by_icao or dst not in by_icao or kind not in ('pax', 'cargo'):
+                      raise ValueError(f'Invalid legacy route: {src} -> {dst} ({kind})')
+                  a, b = by_icao[src], by_icao[dst]
+                  nm, out_bearing = distance_bearing(a, b)
+                  _, return_bearing = distance_bearing(b, a)
+                  out_sector = sector(out_bearing)
+                  return_sector = sector(return_bearing)
+                  out = a[kind]['sectors'][out_sector]
+                  back = b[kind]['sectors'][return_sector]
+                  routes.append({
+                      'from': src, 'to': dst, 'kind': kind,
+                      'sec': out_sector, 'nm': round(nm),
+                      'out_w': week(out['c']), 'out_b': out['b'],
+                      'back_w': week(back['c']),
+                  })
+              return routes
+
+          if not SNAP.is_file():
+              raise RuntimeError('snapshot.json missing: start with your copy of rostykk/ukraine-ns')
+          original_bytes = SNAP.read_bytes()
+          original = json.loads(original_bytes)
+          old_airports = original.get('airports')
+          old_routes = original.get('routes')
+          if not isinstance(old_airports, list) or not old_airports:
+              raise ValueError('snapshot.json has no airports')
+          if not isinstance(old_routes, list) or not old_routes:
+              raise ValueError('snapshot.json has no route templates')
+          catalog = {a['icao']: a for a in old_airports}
+          if len(catalog) != len(old_airports):
+              raise ValueError('Duplicate ICAOs in original snapshot')
+          icaos = sorted(catalog)
+          print(f'Collecting traffic.B for {len(icaos)} airports; max {WORKERS} concurrent requests.', flush=True)
+          print('Strict mode: a failed airport prevents BOTH JSON files from being changed.', flush=True)
+          results = {}
+          first = icaos.pop(0)
+          payload, limits = take_probe(first)
+          results[first] = airport_record(payload, first, catalog[first])
+          remaining, reset, limit = limits['remaining'], limits['reset'], limits['limit']
+          print(f'NewSky quota: {limit}; remaining after probe: {remaining}; reset UTC: {datetime.fromtimestamp(reset, timezone.utc)}', flush=True)
+          queue = icaos[:]
+          with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as executor:
+              while queue:
+                  if remaining <= RESERVE:
+                      pause_until(reset)
+                      code = queue.pop(0)
+                      payload, limits = take_probe(code)
+                      results[code] = airport_record(payload, code, catalog[code])
+                      remaining, reset, limit = limits['remaining'], limits['reset'], limits['limit']
+                      print(f'New quota window: {remaining}/{limit} remaining.', flush=True)
+                      continue
+
+                  n = min(len(queue), remaining - RESERVE)
+                  batch = queue[:n]
+                  del queue[:n]
+                  futures = {executor.submit(request_airport, code): code for code in batch}
+                  observations = []
+                  limited_codes = []
+                  for future in concurrent.futures.as_completed(futures):
+                      code = futures[future]
+                      status, payload, info = future.result()  # Any failure aborts without altering snapshots.
+                      observations.append(info)
+                      if status == 'limited':
+                          limited_codes.append(code)
+                      else:
+                          results[code] = airport_record(payload, code, catalog[code])
+                  if observations:
+                      newest_reset = max(item['reset'] for item in observations)
+                      window = [item for item in observations if item['reset'] == newest_reset]
+                      if newest_reset > reset:
+                          reset = newest_reset
+                          limit = min(item['limit'] for item in window)
+                          remaining = min(item['remaining'] for item in window)
+                      else:
+                          remaining = min(max(0, remaining - n), min(item['remaining'] for item in window))
+                  if limited_codes:
+                      queue = limited_codes + queue
+                      remaining = 0
+                  print(f'{len(results)}/{len(catalog)} airports; remaining={remaining}; queued={len(queue)}', flush=True)
+
+          if len(results) != len(catalog):
+              raise RuntimeError('Incomplete API collection: snapshot not modified')
+          airports = [results[a['icao']] for a in old_airports]
+          routes = rebuild_routes(old_routes, results)
+          updated = {
+              'generated_at': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),
+              'airports': airports,
+              'routes': routes,
+          }
+          new_bytes = (json.dumps(updated, ensure_ascii=False, separators=(',', ':'), allow_nan=False) + '\n').encode('utf-8')
+          # Only replace files AFTER every API call, conversion and route succeeds.
+          # The git step below commits BOTH changes in one commit.
+          PREV.write_bytes(original_bytes)
+          SNAP.write_bytes(new_bytes)
+          print(f'Done. {len(airports)} airports, {len(routes)} routes. Ready for ONE commit.', flush=True)
+          PY
+
+      - name: Commit both files once
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- snapshot.json snapshot_prev.json
+          if git diff --cached --quiet; then
+            echo 'Snapshots unchanged; no commit needed.'
+          else
+            git commit -m "Update NewSky traffic B snapshots"
+            git push
+          fi
