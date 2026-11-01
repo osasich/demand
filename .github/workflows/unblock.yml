@@ -1,0 +1,21 @@
+
+name: Unblock Pages
+
+on:
+  workflow_dispatch:
+
+permissions:
+  pages: write
+
+jobs:
+  unblock:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cancel deployment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          curl --fail-with-body -sS -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/osasich/demand/pages/deployments/e97e48e79dad08fc39a305f000aa69cc0a0f85d5/cancel
