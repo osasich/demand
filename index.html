@@ -121,6 +121,27 @@
   .mx-def1 { background: rgba(239, 68, 68, 0.25); }
   .mx-def2 { background: rgba(239, 68, 68, 0.5); color: #fef2f2; font-weight: 600; }
   .mx-def3 { background: rgba(239, 68, 68, 0.75); color: #fef2f2; font-weight: 700; }
+
+  .snapshot-toolbar {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 12px 16px; background: #0f172a; border-bottom: 1px solid #334155;
+  }
+  .snapshot-toolbar button, .snapshot-toolbar select {
+    background: #1e293b; color: #e2e8f0; border: 1px solid #334155;
+    padding: 8px 11px; border-radius: 6px; font-size: 13px; cursor: pointer;
+  }
+  .snapshot-toolbar button.active { background: #f97316; color: #0b1220; font-weight: 700; border-color: #f97316; }
+  .snapshot-toolbar button:disabled { opacity: .5; cursor: not-allowed; }
+  .snapshot-toolbar label { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #94a3b8; }
+  .snapshot-toolbar select { max-width: 245px; }
+  .snapshot-toolbar .snapshot-dates { color: #94a3b8; font-size: 12px; }
+  .snapshot-info { padding: 9px 16px; background: #111e30; color: #94a3b8; font-size: 12px; border-bottom: 1px solid #233248; }
+  .snapshot-info.err { color: #f87171; }
+  @media (max-width: 650px) {
+    .snapshot-toolbar { gap: 8px; padding: 10px; }
+    .snapshot-toolbar label { width: 100%; }
+    .snapshot-toolbar select { flex: 1; max-width: none; min-width: 0; }
+  }
 </style>
 </head>
 <body>
@@ -645,47 +666,177 @@ function MatrixTab({ data }) {
   );
 }
 
+function ChangesTab({ current, previous, onSelect }) {
+  const [kind, setKind] = useState('pax');
+  const [search, setSearch] = useState('');
+  const [sort, setSort] = useState('absolute');
+  const rows = useMemo(() => {
+    if (!previous) return [];
+    const old = Object.fromEntries(previous.airports.map(a => [a.icao, a]));
+    return current.airports.map(a => {
+      const past = old[a.icao];
+      if (!past || !a[kind]?.sectors || !past[kind]?.sectors) return null;
+      const sum = block => block.sectors.reduce((total, s) => total + Math.ceil(s.c / 4), 0);
+      const now = sum(a[kind]), before = sum(past[kind]);
+      return { icao: a.icao, name: a.name, now, before, delta: now - before, stale: !!a.stale };
+    }).filter(Boolean).sort((a, b) => {
+      if (sort === 'gain') return b.delta - a.delta;
+      if (sort === 'loss') return a.delta - b.delta;
+      return Math.abs(b.delta) - Math.abs(a.delta);
+    });
+  }, [current, previous, kind, sort]);
+  const filtered = rows.filter(a =>
+    (a.icao + ' ' + a.name).toLowerCase().includes(search.trim().toLowerCase())
+  );
+  if (!previous) return <div className="empty-state">Для порівняння потрібно два снапшоти.</div>;
+  return <>
+    <div className="controls">
+      <label>Тип <select value={kind} onChange={e => setKind(e.target.value)}>
+        <option value="pax">Pax</option><option value="cargo">Cargo</option>
+      </select></label>
+      <input placeholder="Пошук ICAO / аеропорту" value={search} onChange={e => setSearch(e.target.value)} />
+      <label>Сортування <select value={sort} onChange={e => setSort(e.target.value)}>
+        <option value="absolute">Найбільші зміни</option>
+        <option value="gain">Найбільший приріст</option>
+        <option value="loss">Найбільше падіння</option>
+      </select></label>
+    </div>
+    <div className="meta">Порівняння попиту за 12 секторами, сума на тиждень. Натисни ICAO для деталей.</div>
+    <div className="scroll-wrap">
+      <table>
+        <thead><tr>
+          <th>ICAO</th><th>Аеропорт</th><th className="num">Було / тиж</th>
+          <th className="num">Стало / тиж</th><th className="num">Δ / тиж</th>
+        </tr></thead>
+        <tbody>{filtered.map(a => <tr key={a.icao} className="clickable" onClick={() => onSelect(a.icao)}>
+          <td className="icao">{a.icao}</td><td>{a.name}{a.stale ? ' · старі дані' : ''}</td>
+          <td className="num">{a.before.toLocaleString('uk-UA')}</td>
+          <td className="num">{a.now.toLocaleString('uk-UA')}</td>
+          <td className="num" style={{ color: a.delta > 0 ? '#4ade80' : a.delta < 0 ? '#f87171' : '#94a3b8', fontWeight: 600 }}>
+            {a.delta > 0 ? '+' : ''}{a.delta.toLocaleString('uk-UA')}
+          </td>
+        </tr>)}</tbody>
+      </table>
+    </div>
+  </>;
+}
+
 // ---------------- App ----------------
 function App() {
+  const [catalog, setCatalog] = useState(null);
+  const [compareMode, setCompareMode] = useState(false);
+  const [newerId, setNewerId] = useState(null);
+  const [olderId, setOlderId] = useState(null);
   const [raw, setRaw] = useState(null);
   const [prevRaw, setPrevRaw] = useState(null);
   const [error, setError] = useState(null);
+  const [loading, setLoading] = useState(true);
   const [selectedIcao, setSelectedIcao] = useState(null);
   const [activeTab, setActiveTab] = useState('backhaul');
   const mapRef = useRef(null);
 
   useEffect(() => {
-    const ts = Date.now();
-    fetch('snapshot.json?ts=' + ts)
-      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
-      .then(setRaw)
-      .catch(e => setError(e.message));
-    // Previous snapshot is optional — silently ignore 404
-    fetch('snapshot_prev.json?ts=' + ts)
-      .then(r => r.ok ? r.json() : null)
-      .then(setPrevRaw)
-      .catch(() => setPrevRaw(null));
+    let cancelled = false;
+    fetch('snapshots/index.json?ts=' + Date.now(), { cache: 'no-store' })
+      .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(manifest => {
+        if (!Array.isArray(manifest.snapshots) || !manifest.snapshots.length) throw new Error('Архів порожній');
+        const entries = manifest.snapshots.filter(x =>
+          typeof x.id === 'string' && typeof x.generated_at === 'string' &&
+          typeof x.file === 'string' && /^snapshots\/[\w-]+\.json$/.test(x.file)
+        ).sort((a, b) => b.generated_at.localeCompare(a.generated_at) || b.id.localeCompare(a.id));
+        if (!entries.length) throw new Error('Архів не містить файлів');
+        if (cancelled) return;
+        setCatalog(entries);
+        setNewerId(entries[0].id);
+        setOlderId(entries[1]?.id || null);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setCatalog([
+          { id: 'latest', file: 'snapshot.json', generated_at: 'Останній снапшот' },
+          { id: 'previous', file: 'snapshot_prev.json', generated_at: 'Попередній снапшот' },
+        ]);
+        setNewerId('latest');
+        setOlderId('previous');
+      });
+    return () => { cancelled = true; };
   }, []);
 
+  const newer = catalog && (compareMode ? catalog.find(x => x.id === newerId) : catalog[0]);
+  const older = catalog && (compareMode ? catalog.find(x => x.id === olderId) : catalog[1]);
+  const newerPath = newer?.file || null;
+  const olderPath = older?.file || null;
+  useEffect(() => {
+    if (!newerPath) return;
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    const fetchJson = path => fetch(path + '?ts=' + Date.now(), { cache: 'no-store' })
+      .then(r => { if (!r.ok) throw new Error(path + ': HTTP ' + r.status); return r.json(); });
+    Promise.all([fetchJson(newerPath), olderPath ? fetchJson(olderPath) : Promise.resolve(null)])
+      .then(([now, before]) => {
+        if (cancelled) return;
+        setRaw(now);
+        setPrevRaw(before);
+        setLoading(false);
+      })
+      .catch(err => {
+        if (cancelled) return;
+        setError(err.message);
+        setLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [newerPath, olderPath]);
+
   const data = useMemo(() => raw ? expandSnapshot(raw, prevRaw) : null, [raw, prevRaw]);
-
-  if (error) return <div className="loading err">❌ {error}<br/>
-    <small>snapshot.json не знайдено? Запусти newsky_export.py локально й закоміть.</small></div>;
-  if (!data) return null;
-
+  const newerIndex = catalog ? catalog.findIndex(x => x.id === newerId) : -1;
+  const olderOptions = catalog && newerIndex >= 0 ? catalog.slice(newerIndex + 1) : [];
   const handleSelect = (icao) => {
     setSelectedIcao(icao);
     window.scrollTo({ top: 0, behavior: 'smooth' });
-    const a = data.byIcao[icao];
+    const a = data?.byIcao[icao];
     if (a && mapRef.current) {
       mapRef.current.flyTo([a.lat, a.lon], Math.max(mapRef.current.getZoom(), 5), { duration: 0.6 });
     }
   };
+  if (!catalog || !data) {
+    return <div className="loading">{error ? '❌ ' + error : '⏳ Завантажую снапшоти...'}</div>;
+  }
 
   return <>
+    <div className="snapshot-toolbar">
+      <button className={!compareMode ? 'active' : ''} onClick={() => { setCompareMode(false); setActiveTab('backhaul'); }}>
+        Останні два
+      </button>
+      <button className={compareMode ? 'active' : ''} disabled={catalog.length < 2}
+        onClick={() => { setCompareMode(true); setActiveTab('changes'); }}>
+        Порівняти
+      </button>
+      {compareMode ? <>
+        <label>Новіший
+          <select value={newerId || ''} onChange={e => {
+            const id = e.target.value;
+            const idx = catalog.findIndex(x => x.id === id);
+            setNewerId(id);
+            if (catalog.findIndex(x => x.id === olderId) <= idx) setOlderId(catalog[idx + 1]?.id || null);
+          }}>
+            {catalog.slice(0, -1).map(s => <option key={s.id} value={s.id}>{s.generated_at}</option>)}
+          </select>
+        </label>
+        <label>Старіший
+          <select value={olderId || ''} onChange={e => setOlderId(e.target.value)}>
+            {olderOptions.map(s => <option key={s.id} value={s.id}>{s.generated_at}</option>)}
+          </select>
+        </label>
+      </> : <span className="snapshot-dates">Зараз: {newer.generated_at} · Було: {older?.generated_at || '—'}</span>}
+      <span className="snapshot-dates">В архіві: {catalog.length}</span>
+    </div>
+    {loading && <div className="snapshot-info">⏳ Завантаження вибраних снапшотів...</div>}
+    {error && <div className="snapshot-info err">❌ {error}. Відображаються останні успішно завантажені дані.</div>}
     <div id="top">
       <MapView data={data} selected={selectedIcao} onSelect={handleSelect} mapRef={mapRef} />
-      <Sidebar data={data} selectedIcao={selectedIcao} onSelect={handleSelect} />
+      <Sidebar data={data} selectedIcao={selectedIcao && data.byIcao[selectedIcao] ? selectedIcao : null} onSelect={handleSelect} />
     </div>
     <div className="legend">
       <div><span className="dot" style={{ background: '#fbbf24', border: '1.5px solid #005bbb' }}></span> UA</div>
@@ -697,9 +848,12 @@ function App() {
                 onClick={() => setActiveTab('backhaul')}>🎯 Backhaul</button>
         <button className={activeTab === 'matrix' ? 'active' : ''}
                 onClick={() => setActiveTab('matrix')}>📊 Matrix</button>
+        {compareMode && <button className={activeTab === 'changes' ? 'active' : ''}
+                onClick={() => setActiveTab('changes')}>📈 Зміни</button>}
       </div>
       {activeTab === 'backhaul' && <BackhaulTab data={data} onSelect={handleSelect} />}
       {activeTab === 'matrix' && <MatrixTab data={data} />}
+      {activeTab === 'changes' && compareMode && <ChangesTab current={raw} previous={prevRaw} onSelect={handleSelect} />}
     </div>
   </>;
 }

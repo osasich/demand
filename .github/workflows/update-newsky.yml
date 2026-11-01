@@ -254,9 +254,58 @@ jobs:
               'routes': build_routes(old_routes, results),
           }
           new_bytes = (json.dumps(updated, ensure_ascii=False, separators=(',', ':'), allow_nan=False) + '\n').encode('utf-8')
+          archive_dir = Path('snapshots')
+          archive_dir.mkdir(parents=True, exist_ok=True)
+          manifest_path = archive_dir / 'index.json'
+          if manifest_path.exists():
+              manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+              if manifest.get('version') != 1 or not isinstance(manifest.get('snapshots'), list):
+                  raise RuntimeError('Invalid snapshots/index.json')
+          else:
+              manifest = {'version': 1, 'snapshots': []}
+
+          known = {entry['file'] for entry in manifest['snapshots']}
+
+          def archive_snapshot(blob):
+              saved = json.loads(blob)
+              date = saved.get('generated_at')
+              if not isinstance(date, str) or not date.endswith(' UTC'):
+                  raise RuntimeError('Snapshot has no valid generated_at')
+              basename = date.replace(' ', '_').replace(':', '-')
+              if not all(ch.isascii() and (ch.isalnum() or ch in '-_') for ch in basename):
+                  raise RuntimeError('Unsafe snapshot timestamp')
+              filename = basename + '.json'
+              path = archive_dir / filename
+              number = 2
+              while path.exists() and path.read_bytes() != blob:
+                  filename = f'{basename}-{number}.json'
+                  path = archive_dir / filename
+                  number += 1
+              if not path.exists():
+                  path.write_bytes(blob)
+              relative = path.as_posix()
+              if relative not in known:
+                  manifest['snapshots'].append({
+                      'id': path.stem,
+                      'file': relative,
+                      'generated_at': date,
+                  })
+                  known.add(relative)
+
+          if PREV.is_file():
+              archive_snapshot(PREV.read_bytes())
+          archive_snapshot(original_bytes)
+          archive_snapshot(new_bytes)
+          manifest['snapshots'].sort(
+              key=lambda item: (item['generated_at'], item['id']), reverse=True
+          )
+          manifest_path.write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2) + '\n',
+              encoding='utf-8'
+          )
           PREV.write_bytes(original_bytes)
           SNAP.write_bytes(new_bytes)
-          print(f'Ready: {len(results)} airports, {len(updated["routes"])} routes. Stale airports: {sorted(stale)}', flush=True)
+          print(f'Ready: {len(results)} airports, {len(updated["routes"])} routes. Archived: {len(manifest["snapshots"])}. Stale airports: {sorted(stale)}', flush=True)
           PY
 
       - name: Commit
@@ -264,7 +313,7 @@ jobs:
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add snapshot.json snapshot_prev.json
+          git add snapshot.json snapshot_prev.json snapshots/
           if ! git diff --cached --quiet; then
             git commit -m "Traffic"
             git push
