@@ -142,6 +142,31 @@
     .snapshot-toolbar label { width: 100%; }
     .snapshot-toolbar select { flex: 1; max-width: none; min-width: 0; }
   }
+
+  .radar-comparison { display: flex; flex-wrap: wrap; gap: 5px; margin: 12px 0 4px; }
+  .radar-comparison button {
+    flex: 1; white-space: nowrap; background: #1e293b; color: #cbd5e1;
+    border: 1px solid #334155; border-radius: 6px; padding: 8px 5px;
+    font-size: 11px; font-weight: 600; cursor: pointer;
+  }
+  .radar-comparison button.active { border-color: #fb923c; background: #313044; color: #fff7ed; }
+  .radar-key { display: flex; justify-content: center; align-items: center; gap: 10px 16px; flex-wrap: wrap; font-size: 12px; margin: 6px 0 14px; }
+  .radar-key span { display: inline-flex; gap: 5px; align-items: center; color: #e2e8f0; }
+  .radar-key small { color: #94a3b8; font-size: 10px; }
+  .radar-swatch { display: inline-block; width: 19px; height: 0; border-top: 3px solid; }
+  .radar-swatch.now { border-color: #fb923c; }
+  .radar-swatch.previous { border-color: #38bdf8; border-top-style: dashed; }
+  .radar-swatch.normal { border-color: #c4b5fd; border-top-style: dotted; }
+  .sector-numbers { margin: 0 0 14px; }
+  .sector-numbers-toggle {
+    width: 100%; background: #19263b; color: #cbd5e1; border: 1px solid #334155;
+    padding: 9px 11px; border-radius: 6px; text-align: left; font-size: 12px;
+    cursor: pointer; font-weight: 600;
+  }
+  .sector-numbers .scroll-wrap { margin: 8px 0 0; max-height: none; }
+  .sector-numbers table { font-size: 11px; }
+  .sector-numbers th, .sector-numbers td { padding: 7px 5px; }
+  .sector-numbers-unit { font-size: 10px; color: #94a3b8; margin-top: 6px; }
 </style>
 </head>
 <body>
@@ -278,7 +303,7 @@ function MapView({ data, selected, onSelect, mapRef }) {
   return <div ref={mapDiv} id="map"></div>;
 }
 
-function RadarChart({ airport, kind }) {
+function RadarChart({ airport, kind, comparison }) {
   const canvasRef = useRef(null);
   const chartRef = useRef(null);
   useEffect(() => {
@@ -286,52 +311,112 @@ function RadarChart({ airport, kind }) {
     if (chartRef.current) { chartRef.current.destroy(); chartRef.current = null; }
     const sectors = airport[kind]?.sectors;
     if (!sectors) return;
+    const hasPrevious = sectors[0].prev_current_w != null;
+    const showPrevious = hasPrevious && comparison !== 'normal';
+    const showNormal = comparison !== 'previous' || !hasPrevious;
+    const datasets = [];
+    if (showNormal) datasets.push({
+      label: 'Норма',
+      data: sectors.map(s => s.normal_w),
+      backgroundColor: 'transparent', borderColor: '#c4b5fd',
+      borderWidth: 2.5, borderDash: [2, 6], pointStyle: 'triangle',
+      pointBackgroundColor: '#c4b5fd', pointBorderColor: '#0f172a',
+      pointBorderWidth: 1.5, pointRadius: 4, pointHoverRadius: 7,
+    });
+    if (showPrevious) datasets.push({
+      label: 'Було',
+      data: sectors.map(s => s.prev_current_w),
+      backgroundColor: 'transparent', borderColor: '#38bdf8',
+      borderWidth: 2.8, borderDash: [9, 5], pointStyle: 'rectRot',
+      pointBackgroundColor: '#38bdf8', pointBorderColor: '#0f172a',
+      pointBorderWidth: 1.5, pointRadius: 4, pointHoverRadius: 7,
+    });
+    datasets.push({
+      label: 'Зараз',
+      data: sectors.map(s => s.current_w),
+      backgroundColor: 'rgba(249,115,22,0.10)', borderColor: '#fb923c',
+      borderWidth: 3, borderDash: [], fill: true,
+      pointStyle: 'circle', pointBackgroundColor: '#fb923c',
+      pointBorderColor: '#0f172a', pointBorderWidth: 1,
+      pointRadius: 4, pointHoverRadius: 7,
+    });
     chartRef.current = new Chart(canvasRef.current.getContext('2d'), {
       type: 'radar',
-      data: {
-        labels: sectors.map(s => s.short),
-        datasets: [
-          { label: 'Норма', data: sectors.map(s => s.normal_w),
-            backgroundColor: 'rgba(148,163,184,0.08)', borderColor: 'rgba(148,163,184,0.6)',
-            borderWidth: 1, borderDash: [4, 4], pointRadius: 0 },
-          ...(sectors[0].prev_current_w != null ? [{
-            label: 'Було',
-            data: sectors.map(s => s.prev_current_w),
-            backgroundColor: 'rgba(56,189,248,0.05)',
-            borderColor: 'rgba(56,189,248,0.5)',
-            borderWidth: 1.5, borderDash: [2, 3], pointRadius: 0,
-          }] : []),
-          { label: 'Зараз', data: sectors.map(s => s.current_w),
-            backgroundColor: 'rgba(249,115,22,0.25)', borderColor: 'rgba(249,115,22,0.9)',
-            borderWidth: 2, pointBackgroundColor: 'rgba(249,115,22,1)',
-            pointRadius: 3, pointHoverRadius: 6 },
-        ]
-      },
+      data: { labels: sectors.map(s => s.short), datasets },
       options: {
         responsive: true, maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
         plugins: {
           legend: { display: false },
-          tooltip: { callbacks: { label: (ctx) => {
-            const unit = kind === 'pax' ? '' : 'т';
-            return `${ctx.dataset.label}: ${ctx.parsed.r}${unit}/тижд`;
-          }}}
+          tooltip: {
+            backgroundColor: '#1e293b',
+            titleColor: '#f1f5f9',
+            bodyColor: '#e2e8f0',
+            padding: 11,
+            callbacks: {
+              label: ctx => {
+                const unit = kind === 'pax' ? ' пас.' : ' т';
+                return ctx.dataset.label + ': ' + Number(ctx.parsed.r).toLocaleString('uk-UA') + unit + '/тижд';
+              }
+            }
+          }
         },
         scales: { r: {
           beginAtZero: true,
-          grid: { color: 'rgba(148,163,184,0.15)' },
+          grid: { color: 'rgba(148,163,184,0.18)' },
           angleLines: { color: 'rgba(148,163,184,0.2)' },
-          pointLabels: { color: '#cbd5e1', font: { size: 11 } },
+          pointLabels: { color: '#e2e8f0', font: { size: 12, weight: '600' } },
           ticks: { display: false, backdropColor: 'transparent' },
         }},
       }
     });
     return () => { if (chartRef.current) { chartRef.current.destroy(); chartRef.current = null; } };
-  }, [airport, kind]);
+  }, [airport, kind, comparison]);
   return <canvas ref={canvasRef}></canvas>;
+}
+
+function SectorNumbers({ airport, kind }) {
+  const [open, setOpen] = useState(false);
+  const sectors = airport[kind]?.sectors || [];
+  const hasPrevious = sectors.length > 0 && sectors[0].prev_current_w != null;
+  const fmt = value => value == null ? '—' : Number(value).toLocaleString('uk-UA');
+  return <div className="sector-numbers">
+    <button type="button" className="sector-numbers-toggle" onClick={() => setOpen(!open)}>
+      {open ? '▾ Приховати' : '▸ Показати'} точні значення за 12 напрямками
+    </button>
+    {open && <div className="scroll-wrap">
+      <table>
+        <thead><tr>
+          <th>Напрям</th>
+          {hasPrevious && <th className="num" style={{ color: '#38bdf8' }}>Було</th>}
+          <th className="num" style={{ color: '#fb923c' }}>Зараз</th>
+          <th className="num" style={{ color: '#c4b5fd' }}>Норма</th>
+          {hasPrevious && <th className="num">Δ</th>}
+        </tr></thead>
+        <tbody>
+          {sectors.map((s, i) => {
+            const diff = hasPrevious ? s.current_w - s.prev_current_w : null;
+            return <tr key={i}>
+              <td style={{ whiteSpace: 'nowrap' }}>{s.short}</td>
+              {hasPrevious && <td className="num" style={{ color: '#7dd3fc' }}>{fmt(s.prev_current_w)}</td>}
+              <td className="num" style={{ color: '#fdba74', fontWeight: 700 }}>{fmt(s.current_w)}</td>
+              <td className="num" style={{ color: '#ddd6fe' }}>{fmt(s.normal_w)}</td>
+              {hasPrevious && <td className="num" style={{
+                color: diff > 0 ? '#4ade80' : diff < 0 ? '#f87171' : '#94a3b8',
+                fontWeight: 600
+              }}>{diff > 0 ? '+' : ''}{fmt(diff)}</td>}
+            </tr>;
+          })}
+        </tbody>
+      </table>
+    </div>}
+    <div className="sector-numbers-unit">Усі значення — за тиждень{kind === 'cargo' ? ', тонн' : ', пасажирів'}.</div>
+  </div>;
 }
 
 function Sidebar({ data, selectedIcao, onSelect }) {
   const [kind, setKind] = useState('pax');
+  const [comparison, setComparison] = useState('previous');
   if (!selectedIcao) {
     return (
       <div id="side">
@@ -368,13 +453,27 @@ function Sidebar({ data, selectedIcao, onSelect }) {
         <button className={kind === 'cargo' ? 'active' : ''} onClick={() => setKind('cargo')}>📦 Cargo</button>
       </div>
       <h3>Попит по секторах</h3>
-      <div style={{ position: 'relative', height: 280, margin: '8px 0 12px' }}>
-        <RadarChart airport={a} kind={kind} />
+      <div className="radar-comparison">
+        {a[kind]?.sectors?.[0]?.prev_current_w != null && <button
+          type="button" className={comparison === 'previous' ? 'active' : ''}
+          onClick={() => setComparison('previous')}>Зараз ↔ Було</button>}
+        <button type="button" className={comparison === 'normal' || a[kind]?.sectors?.[0]?.prev_current_w == null ? 'active' : ''}
+          onClick={() => setComparison('normal')}>Зараз ↔ Норма</button>
+        {a[kind]?.sectors?.[0]?.prev_current_w != null && <button
+          type="button" className={comparison === 'all' ? 'active' : ''}
+          onClick={() => setComparison('all')}>Усі три</button>}
       </div>
-      <div className="meta" style={{ textAlign: 'center', fontSize: 11, marginBottom: 12 }}>
-        🟧 поточний · ⚪ норма
-        {data.hours_elapsed != null && ' · 🔵 було'}
+      <div style={{ position: 'relative', height: 300, margin: '4px 0 8px' }}>
+        <RadarChart airport={a} kind={kind} comparison={comparison} />
       </div>
+      <div className="radar-key">
+        <span><i className="radar-swatch now"></i> Зараз <small>{data.generated_at?.slice(0, 16)}</small></span>
+        {a[kind]?.sectors?.[0]?.prev_current_w != null && comparison !== 'normal' &&
+          <span><i className="radar-swatch previous"></i> Було <small>{data.prev_generated_at?.slice(0, 16)}</small></span>}
+        {(comparison !== 'previous' || a[kind]?.sectors?.[0]?.prev_current_w == null) &&
+          <span><i className="radar-swatch normal"></i> Норма</span>}
+      </div>
+      <SectorNumbers airport={a} kind={kind} />
       <DeltaTable airport={a} kind={kind} hoursElapsed={data.hours_elapsed} />
       {a.is_ua ? <UaRoutes airport={a} kind={kind} routes={data.routes} />
               : <ForeignRoutes airport={a} kind={kind} routes={data.routes} />}
