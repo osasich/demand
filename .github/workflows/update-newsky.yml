@@ -15,12 +15,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: true
+      - uses: actions/checkout@v4
 
-      - name: Build both snapshots (NewSky traffic B)
+      - name: Update snapshots
         shell: bash
         env:
           NEWSKY_COOKIE: ${{ secrets.NEWSKY_COOKIE }}
@@ -37,244 +34,238 @@ jobs:
           from urllib.error import HTTPError, URLError
           from urllib.request import Request, urlopen
 
-          API = 'https://newsky.app/api/airport/'
-          COOKIE = os.environ.get('NEWSKY_COOKIE', '').strip()
-          if not COOKIE:
-              raise RuntimeError('Missing NEWSKY_COOKIE secret')
-          WORKERS = 16
-          RESERVE = 2
-          RETRIES = 4
           SNAP = Path('snapshot.json')
           PREV = Path('snapshot_prev.json')
+          WORKERS = 16
+          RETRIES = 4
+          MAX_STALE = 10
+          cookie = os.environ.get('NEWSKY_COOKIE', '').strip()
+          if cookie.lower().startswith('cookie:'):
+              cookie = cookie.partition(':')[2].strip()
+          if not cookie:
+              raise RuntimeError('NEWSKY_COOKIE is missing')
 
-          def week(value):
-              return math.ceil(value / 4)
-
-          def headers_info(headers):
+          def quota(headers):
               try:
-                  return {
-                      'limit': int(headers['X-Rate-Limit-Limit']),
-                      'remaining': int(headers['X-Rate-Limit-Remaining']),
-                      'reset': int(headers['X-Rate-Limit-Reset']),
-                  }
-              except (KeyError, ValueError, TypeError) as ex:
-                  raise RuntimeError('API did not return the expected X-Rate-Limit-* headers; stopping to avoid uncontrolled requests') from ex
+                  return (int(headers['X-Rate-Limit-Remaining']), int(headers['X-Rate-Limit-Reset']), int(headers['X-Rate-Limit-Limit']))
+              except (KeyError, ValueError, TypeError):
+                  return None
+
+          def error_text(response):
+              try:
+                  body = response.read(512).decode('utf-8', errors='replace').replace('\n', ' ')
+                  return body.replace(cookie, '[hidden]')[:250]
+              except Exception:
+                  return ''
 
           def request_airport(icao):
-              url = API + icao
+              url = f'https://newsky.app/api/airport/{icao}'
+              req = Request(url, headers={
+                  'Accept': 'application/json',
+                  'User-Agent': 'Mozilla/5.0',
+                  'Referer': f'https://newsky.app/airport/{icao}',
+                  'Cookie': cookie,
+              })
               for attempt in range(RETRIES):
-                  req = Request(url, headers={
-                      'Accept': 'application/json',
-                      'User-Agent': 'Mozilla/5.0',
-                      'Cookie': COOKIE,
-                  })
                   try:
-                      with urlopen(req, timeout=30) as response:
-                          data = json.load(response)
-                          limits = headers_info(response.headers)
-                          return ('ok', data, limits)
-                  except HTTPError as ex:
-                      if ex.code == 429:
-                          try:
-                              limits = headers_info(ex.headers)
-                          except RuntimeError:
-                              # Some servers omit quota headers on 429 responses.
-                              limits = {'limit': 200, 'remaining': 0, 'reset': int(time.time() + 60)}
-                          retry_after = ex.headers.get('Retry-After', '0')
-                          try:
-                              limits['reset'] = max(limits['reset'], int(time.time() + float(retry_after)))
-                          except ValueError:
-                              pass
-                          return ('limited', None, limits)
-                      if ex.code in (401, 403):
-                          raise RuntimeError(f'{icao}: HTTP {ex.code}. NewSky rejected session; no snapshots changed') from ex
-                      if ex.code not in (408, 500, 502, 503, 504) or attempt + 1 == RETRIES:
-                          raise RuntimeError(f'{icao}: HTTP {ex.code}; no snapshots changed') from ex
-                  except (URLError, TimeoutError, ConnectionError, json.JSONDecodeError) as ex:
-                      if attempt + 1 == RETRIES:
-                          raise RuntimeError(f'{icao}: API/network error: {ex}; no snapshots changed') from ex
-                  time.sleep(min(2 ** attempt, 8) + random.uniform(0, .4))
-              raise RuntimeError(f'{icao}: all retries failed')
+                      with urlopen(req, timeout=35) as response:
+                          return ('ok', json.load(response), quota(response.headers), '')
+                  except HTTPError as exc:
+                      limits = quota(exc.headers)
+                      body = error_text(exc)
+                      if exc.code in (400, 404):
+                          return ('missing', None, limits, f'HTTP {exc.code}: {body}')
+                      if exc.code in (401, 403):
+                          raise RuntimeError(f'{icao}: HTTP {exc.code}: {body}. Check NEWSKY_COOKIE') from exc
+                      if exc.code == 429:
+                          reset = limits[1] if limits else int(time.time() + 60)
+                          retry_after = exc.headers.get('Retry-After')
+                          if retry_after:
+                              try:
+                                  reset = max(reset, int(time.time() + float(retry_after)))
+                              except ValueError:
+                                  pass
+                          return ('limited', None, (0, reset, limits[2] if limits else 200), body)
+                      if exc.code not in (408, 500, 502, 503, 504) or attempt == RETRIES - 1:
+                          raise RuntimeError(f'{icao}: HTTP {exc.code}: {body}') from exc
+                  except (URLError, TimeoutError, ConnectionError, json.JSONDecodeError) as exc:
+                      if attempt == RETRIES - 1:
+                          raise RuntimeError(f'{icao}: {type(exc).__name__}: {exc}') from exc
+                  time.sleep(min(2 ** attempt, 8) + random.random() * 0.5)
+              raise RuntimeError(f'{icao}: failed after retries')
 
-          def pause_until(reset):
-              wait = max(1.0, reset - time.time() + 1.0)
-              print(f'API quota reached; waiting {wait:.1f}s for reset (no requests sent)', flush=True)
-              time.sleep(wait)
-
-          def take_probe(icao):
+          def get_probe(icao):
               for _ in range(6):
-                  status, payload, limits = request_airport(icao)
+                  status, data, limits, error = request_airport(icao)
                   if status == 'ok':
-                      return payload, limits
-                  pause_until(limits['reset'])
-              raise RuntimeError(f'Cannot pass API rate limit for {icao}')
+                      if limits is None:
+                          raise RuntimeError('NewSky did not return quota headers')
+                      return data, limits
+                  if status != 'limited':
+                      raise RuntimeError(f'Validation probe {icao}: {error}')
+                  wait_until(limits[1])
+              raise RuntimeError(f'{icao}: API quota unavailable')
 
-          def airport_record(obj, icao, old):
-              if not isinstance(obj, dict) or obj.get('icao', '').upper() != icao:
-                  raise ValueError(f'{icao}: invalid API response or different ICAO')
-              traffic = obj.get('traffic') or {}
-              b = traffic.get('B')
+          def wait_until(reset):
+              seconds = max(1.0, reset - time.time() + 1.0)
+              print(f'Waiting {seconds:.1f}s for API reset', flush=True)
+              time.sleep(seconds)
+
+          def convert(icao, raw, old):
+              if not isinstance(raw, dict) or raw.get('icao', '').upper() != icao:
+                  raise ValueError(f'{icao}: bad airport response')
+              b = (raw.get('traffic') or {}).get('B')
               if not isinstance(b, dict):
-                  raise ValueError(f'{icao}: traffic.B is missing')
-              location = obj.get('location') or {}
-              lat, lon = location.get('lat'), location.get('lon')
-              if any(isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) for x in (lat, lon)):
+                  raise ValueError(f'{icao}: missing traffic.B')
+              loc = raw.get('location') or {}
+              lat, lon = loc.get('lat'), loc.get('lon')
+              if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in (lat, lon)):
                   raise ValueError(f'{icao}: invalid coordinates')
-              if not (-90 <= lat <= 90 and -180 <= lon <= 180):
-                  raise ValueError(f'{icao}: coordinates out of range')
-              result = {
+              out = {
                   'icao': icao,
-                  'name': obj.get('name') or old.get('name') or icao,
-                  'city': obj.get('city') or old.get('city') or '',
-                  'country': obj.get('country') or old.get('country') or '',
+                  'name': raw.get('name') or old.get('name') or icao,
+                  'city': raw.get('city') or old.get('city') or '',
+                  'country': raw.get('country') or old.get('country') or '',
                   'lat': lat,
                   'lon': lon,
-                  'is_ua': obj.get('countryCode') == 'UA' or bool(old.get('is_ua', False)),
+                  'is_ua': raw.get('countryCode') == 'UA' or bool(old.get('is_ua')),
               }
               for kind in ('pax', 'cargo'):
-                  block = b.get(kind)
-                  directions = block.get('directions') if isinstance(block, dict) else None
+                  source = b.get(kind)
+                  directions = source.get('directions') if isinstance(source, dict) else None
                   if not isinstance(directions, list) or len(directions) != 12:
-                      raise ValueError(f'{icao}: B.{kind} must have exactly 12 directions')
+                      raise ValueError(f'{icao}: B.{kind} needs 12 directions')
                   sectors = []
-                  for i, item in enumerate(directions):
-                      if not isinstance(item, dict):
-                          raise ValueError(f'{icao}: invalid B.{kind}[{i}]')
-                      c, n, bias = (item.get(x) for x in ('current', 'normal', 'bias'))
-                      if any(isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) for x in (c, n, bias)):
-                          raise ValueError(f'{icao}: invalid B.{kind}[{i}] values')
+                  for direction in directions:
+                      c, n, bias = (direction.get(k) for k in ('current', 'normal', 'bias'))
+                      if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in (c, n, bias)):
+                          raise ValueError(f'{icao}: invalid B.{kind}')
                       if c < 0 or n < 0:
-                          raise ValueError(f'{icao}: negative B.{kind}[{i}] demand')
+                          raise ValueError(f'{icao}: negative demand')
                       sectors.append({'c': c, 'n': n, 'b': bias})
-                  result[kind] = {'sectors': sectors}
-              return result
+                  out[kind] = {'sectors': sectors}
+              return out
 
-          def distance_bearing(a, b):
-              lat1, lat2 = math.radians(a['lat']), math.radians(b['lat'])
-              dlat = lat2 - lat1
-              dlon = math.radians(b['lon'] - a['lon'])
-              h = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+          def retained(old, icao):
+              for kind in ('pax', 'cargo'):
+                  sectors = (old.get(kind) or {}).get('sectors')
+                  if not isinstance(sectors, list) or len(sectors) != 12:
+                      raise RuntimeError(f'{icao}: cannot retain old airport data')
+              return {**old, 'stale': True}
+
+          def geometry(a, b):
+              p1, p2 = math.radians(a['lat']), math.radians(b['lat'])
+              dp = p2 - p1
+              dl = math.radians(b['lon'] - a['lon'])
+              h = math.sin(dp / 2)**2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2)**2
               nm = 3440.065 * 2 * math.asin(min(1, math.sqrt(max(0, h))))
-              y = math.sin(dlon) * math.cos(lat2)
-              x = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(dlon)
+              y = math.sin(dl) * math.cos(p2)
+              x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
               bearing = (math.degrees(math.atan2(y, x)) + 360) % 360
-              return nm, bearing
+              return round(nm), int((bearing + 15) // 30) % 12
 
-          def sector(bearing):
-              return int((bearing + 15) // 30) % 12
-
-          def rebuild_routes(old_routes, by_icao):
-              # Preserve rostykk's original airport pairs: the source repo does not
-              # include its route-discovery algorithm. Recompute all demand data
-              # using fresh B sectors in both directions for each existing pair.
-              routes = []
-              for old in old_routes:
-                  src, dst, kind = old.get('from'), old.get('to'), old.get('kind')
-                  if src not in by_icao or dst not in by_icao or kind not in ('pax', 'cargo'):
-                      raise ValueError(f'Invalid legacy route: {src} -> {dst} ({kind})')
-                  a, b = by_icao[src], by_icao[dst]
-                  nm, out_bearing = distance_bearing(a, b)
-                  _, return_bearing = distance_bearing(b, a)
-                  out_sector = sector(out_bearing)
-                  return_sector = sector(return_bearing)
-                  out = a[kind]['sectors'][out_sector]
-                  back = b[kind]['sectors'][return_sector]
-                  routes.append({
+          def build_routes(old_routes, airports):
+              new_routes = []
+              for route in old_routes:
+                  src, dst, kind = route['from'], route['to'], route['kind']
+                  if src not in airports or dst not in airports or kind not in ('pax', 'cargo'):
+                      raise RuntimeError(f'Invalid route: {src}-{dst}-{kind}')
+                  a, b = airports[src], airports[dst]
+                  distance, sec = geometry(a, b)
+                  _, ret_sec = geometry(b, a)
+                  outbound = a[kind]['sectors'][sec]
+                  backhaul = b[kind]['sectors'][ret_sec]
+                  new_routes.append({
                       'from': src, 'to': dst, 'kind': kind,
-                      'sec': out_sector, 'nm': round(nm),
-                      'out_w': week(out['c']), 'out_b': out['b'],
-                      'back_w': week(back['c']),
+                      'sec': sec, 'nm': distance,
+                      'out_w': math.ceil(outbound['c'] / 4),
+                      'out_b': outbound['b'],
+                      'back_w': math.ceil(backhaul['c'] / 4),
                   })
-              return routes
+              return new_routes
 
           if not SNAP.is_file():
-              raise RuntimeError('snapshot.json missing: start with your copy of rostykk/ukraine-ns')
+              raise RuntimeError('snapshot.json is missing')
           original_bytes = SNAP.read_bytes()
           original = json.loads(original_bytes)
-          old_airports = original.get('airports')
-          old_routes = original.get('routes')
-          if not isinstance(old_airports, list) or not old_airports:
-              raise ValueError('snapshot.json has no airports')
-          if not isinstance(old_routes, list) or not old_routes:
-              raise ValueError('snapshot.json has no route templates')
+          old_airports = original['airports']
+          old_routes = original['routes']
           catalog = {a['icao']: a for a in old_airports}
-          if len(catalog) != len(old_airports):
-              raise ValueError('Duplicate ICAOs in original snapshot')
-          icaos = sorted(catalog)
-          print(f'Collecting traffic.B for {len(icaos)} airports; max {WORKERS} concurrent requests.', flush=True)
-          print('Strict mode: a failed airport prevents BOTH JSON files from being changed.', flush=True)
-          results = {}
-          first = icaos.pop(0)
-          payload, limits = take_probe(first)
-          results[first] = airport_record(payload, first, catalog[first])
-          remaining, reset, limit = limits['remaining'], limits['reset'], limits['limit']
-          print(f'NewSky quota: {limit}; remaining after probe: {remaining}; reset UTC: {datetime.fromtimestamp(reset, timezone.utc)}', flush=True)
-          queue = icaos[:]
-          with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as executor:
-              while queue:
-                  if remaining <= RESERVE:
-                      pause_until(reset)
-                      code = queue.pop(0)
-                      payload, limits = take_probe(code)
-                      results[code] = airport_record(payload, code, catalog[code])
-                      remaining, reset, limit = limits['remaining'], limits['reset'], limits['limit']
-                      print(f'New quota window: {remaining}/{limit} remaining.', flush=True)
-                      continue
+          if len(catalog) != len(old_airports) or not catalog:
+              raise RuntimeError('Invalid airport catalog')
+          probe = 'UKBB' if 'UKBB' in catalog else sorted(catalog)[0]
+          print(f'Checking API with {probe}', flush=True)
+          payload, limits = get_probe(probe)
+          results = {probe: convert(probe, payload, catalog[probe])}
+          remaining, reset, limit = limits
+          queue = sorted(set(catalog) - {probe})
+          stale = {}
+          print(f'Authenticated. Processing {len(catalog)} airports with {WORKERS} workers. Quota {remaining}/{limit}', flush=True)
 
-                  n = min(len(queue), remaining - RESERVE)
-                  batch = queue[:n]
-                  del queue[:n]
-                  futures = {executor.submit(request_airport, code): code for code in batch}
-                  observations = []
-                  limited_codes = []
+          with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as pool:
+              while queue:
+                  if remaining <= 1:
+                      wait_until(reset)
+                      payload, limits = get_probe(probe)
+                      results[probe] = convert(probe, payload, catalog[probe])
+                      remaining, reset, limit = limits
+                      continue
+                  n = min(len(queue), remaining - 1)
+                  batch, queue = queue[:n], queue[n:]
+                  futures = {pool.submit(request_airport, icao): icao for icao in batch}
+                  seen = []
+                  limited = []
                   for future in concurrent.futures.as_completed(futures):
-                      code = futures[future]
-                      status, payload, info = future.result()  # Any failure aborts without altering snapshots.
-                      observations.append(info)
-                      if status == 'limited':
-                          limited_codes.append(code)
+                      icao = futures[future]
+                      status, raw, limits_out, message = future.result()
+                      if limits_out:
+                          seen.append(limits_out)
+                      if status == 'ok':
+                          results[icao] = convert(icao, raw, catalog[icao])
+                      elif status == 'limited':
+                          limited.append(icao)
                       else:
-                          results[code] = airport_record(payload, code, catalog[code])
-                  if observations:
-                      newest_reset = max(item['reset'] for item in observations)
-                      window = [item for item in observations if item['reset'] == newest_reset]
-                      if newest_reset > reset:
-                          reset = newest_reset
-                          limit = min(item['limit'] for item in window)
-                          remaining = min(item['remaining'] for item in window)
+                          stale[icao] = message
+                          results[icao] = retained(catalog[icao], icao)
+                          print(f'{icao}: {message}; keeping previous values', flush=True)
+                          if len(stale) > MAX_STALE:
+                              raise RuntimeError(f'Too many unavailable airports ({len(stale)}); snapshots unchanged')
+                  if seen:
+                      latest_reset = max(q[1] for q in seen)
+                      latest = [q for q in seen if q[1] == latest_reset]
+                      if latest_reset > reset:
+                          reset = latest_reset
+                          remaining = min(q[0] for q in latest)
+                          limit = min(q[2] for q in latest)
                       else:
-                          remaining = min(max(0, remaining - n), min(item['remaining'] for item in window))
-                  if limited_codes:
-                      queue = limited_codes + queue
+                          remaining = min(max(0, remaining - n), min(q[0] for q in latest))
+                  else:
+                      remaining = max(0, remaining - n)
+                  if limited:
+                      queue = limited + queue
                       remaining = 0
-                  print(f'{len(results)}/{len(catalog)} airports; remaining={remaining}; queued={len(queue)}', flush=True)
+                  print(f'{len(results)}/{len(catalog)} airports; quota {remaining}/{limit}; pending {len(queue)}', flush=True)
 
           if len(results) != len(catalog):
-              raise RuntimeError('Incomplete API collection: snapshot not modified')
-          airports = [results[a['icao']] for a in old_airports]
-          routes = rebuild_routes(old_routes, results)
+              raise RuntimeError('Incomplete airport collection')
           updated = {
               'generated_at': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),
-              'airports': airports,
-              'routes': routes,
+              'airports': [results[a['icao']] for a in old_airports],
+              'routes': build_routes(old_routes, results),
           }
           new_bytes = (json.dumps(updated, ensure_ascii=False, separators=(',', ':'), allow_nan=False) + '\n').encode('utf-8')
-          # Only replace files AFTER every API call, conversion and route succeeds.
-          # The git step below commits BOTH changes in one commit.
           PREV.write_bytes(original_bytes)
           SNAP.write_bytes(new_bytes)
-          print(f'Done. {len(airports)} airports, {len(routes)} routes. Ready for ONE commit.', flush=True)
+          print(f'Ready: {len(results)} airports, {len(updated["routes"])} routes. Stale airports: {sorted(stale)}', flush=True)
           PY
 
-      - name: Commit both files once
+      - name: Commit
         shell: bash
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -- snapshot.json snapshot_prev.json
-          if git diff --cached --quiet; then
-            echo 'Snapshots unchanged; no commit needed.'
-          else
+          git add snapshot.json snapshot_prev.json
+          if ! git diff --cached --quiet; then
             git commit -m "Traffic"
             git push
           fi
