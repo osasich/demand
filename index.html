@@ -301,7 +301,7 @@ function RadarChart({ airport, kind }) {
             borderColor: 'rgba(56,189,248,0.80)',
             borderWidth: 1.8, borderDash: [2, 3], pointRadius: 0,
           }] : []),
-          { label: 'Зараз', data: sectors.map(s => s.current_w),
+          { label: 'Поточний', data: sectors.map(s => s.current_w),
             backgroundColor: 'rgba(249,115,22,0.18)', borderColor: 'rgba(249,115,22,1)',
             borderWidth: 2.3, pointBackgroundColor: 'rgba(249,115,22,1)',
             pointRadius: 3, pointHoverRadius: 6 },
@@ -311,10 +311,20 @@ function RadarChart({ airport, kind }) {
         responsive: true, maintainAspectRatio: false,
         plugins: {
           legend: { display: false },
-          tooltip: { callbacks: { label: (ctx) => {
-            const unit = kind === 'pax' ? '' : 'т';
-            return `${ctx.dataset.label}: ${ctx.parsed.r}${unit}/тижд`;
-          }}}
+          tooltip: {
+            mode: 'index',
+            intersect: true,
+            itemSort: (a, b) => {
+              const order = ['Поточний', 'Було', 'Норма'];
+              return order.indexOf(a.dataset.label) - order.indexOf(b.dataset.label);
+            },
+            callbacks: {
+              label: (ctx) => {
+                const unit = kind === 'pax' ? '' : 'т';
+                return `${ctx.dataset.label}: ${ctx.parsed.r}${unit}/тижд`;
+              },
+            },
+          }
         },
         scales: { r: {
           beginAtZero: true,
