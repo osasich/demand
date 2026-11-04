@@ -36,6 +36,7 @@ jobs:
 
           SNAP = Path('snapshot.json')
           PREV = Path('snapshot_prev.json')
+          EXTRA = Path('airports_extra.txt')
           WORKERS = 16
           RETRIES = 4
           MAX_STALE = 10
@@ -164,7 +165,25 @@ jobs:
               bearing = (math.degrees(math.atan2(y, x)) + 360) % 360
               return round(nm), int((bearing + 15) // 30) % 12
 
-          def build_routes(old_routes, airports):
+          def build_routes(old_routes, airports, new_icaos):
+              # Preserve existing routes; extend only for newly collected airports.
+              # Original geographic range: approximately 200-6500 km.
+              known = {(r['from'], r['to'], r['kind']) for r in old_routes}
+              for src in sorted(airports):
+                  for dst in sorted(airports):
+                      if src == dst or (src not in new_icaos and dst not in new_icaos):
+                          continue
+                      a, b = airports[src], airports[dst]
+                      if not (a['is_ua'] or b['is_ua']):
+                          continue
+                      nm, _ = geometry(a, b)
+                      if not 108 <= nm <= 3509:
+                          continue
+                      for kind in ('pax', 'cargo'):
+                          key = (src, dst, kind)
+                          if key not in known:
+                              old_routes.append({'from': src, 'to': dst, 'kind': kind})
+                              known.add(key)
               new_routes = []
               for route in old_routes:
                   src, dst, kind = route['from'], route['to'], route['kind']
@@ -193,6 +212,20 @@ jobs:
           catalog = {a['icao']: a for a in old_airports}
           if len(catalog) != len(old_airports) or not catalog:
               raise RuntimeError('Invalid airport catalog')
+          if not EXTRA.is_file():
+              raise RuntimeError('airports_extra.txt is missing')
+          extra_codes = []
+          for line in EXTRA.read_text(encoding='utf-8').splitlines():
+              for code in line.partition('#')[0].split():
+                  if len(code) != 4 or not code.isascii() or not code.isalnum() or not code.isupper():
+                      raise RuntimeError(f'Invalid airport ICAO code: {code}')
+                  extra_codes.append(code)
+          if len(set(extra_codes)) != len(extra_codes):
+              raise RuntimeError('Duplicate ICAO codes in airports_extra.txt')
+          new_icaos = set(extra_codes) - set(catalog)
+          for icao in sorted(new_icaos):
+              catalog[icao] = {'icao': icao, 'is_ua': icao.startswith('UK')}
+          print(f'New ICAO codes to collect: {len(new_icaos)}', flush=True)
           probe = 'UKBB' if 'UKBB' in catalog else sorted(catalog)[0]
           print(f'Checking API with {probe}', flush=True)
           payload, limits = get_probe(probe)
@@ -200,6 +233,7 @@ jobs:
           remaining, reset, limit = limits
           queue = sorted(set(catalog) - {probe})
           stale = {}
+          unavailable_new = {}
           print(f'Authenticated. Processing {len(catalog)} airports with {WORKERS} workers. Quota {remaining}/{limit}', flush=True)
 
           with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as pool:
@@ -221,9 +255,18 @@ jobs:
                       if limits_out:
                           seen.append(limits_out)
                       if status == 'ok':
-                          results[icao] = convert(icao, raw, catalog[icao])
+                          try:
+                              results[icao] = convert(icao, raw, catalog[icao])
+                          except ValueError as exc:
+                              if icao not in new_icaos:
+                                  raise
+                              unavailable_new[icao] = str(exc)
+                              print(f'{icao}: {exc}; no valid NewSky B data, skipping this new airport', flush=True)
                       elif status == 'limited':
                           limited.append(icao)
+                      elif icao in new_icaos:
+                          unavailable_new[icao] = message
+                          print(f'{icao}: {message}; not available on NewSky, skipping', flush=True)
                       else:
                           stale[icao] = message
                           results[icao] = retained(catalog[icao], icao)
@@ -246,12 +289,15 @@ jobs:
                       remaining = 0
                   print(f'{len(results)}/{len(catalog)} airports; quota {remaining}/{limit}; pending {len(queue)}', flush=True)
 
-          if len(results) != len(catalog):
+          if set(results) | set(unavailable_new) != set(catalog):
               raise RuntimeError('Incomplete airport collection')
           updated = {
               'generated_at': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),
-              'airports': [results[a['icao']] for a in old_airports],
-              'routes': build_routes(old_routes, results),
+              'airports': (
+                  [results[a['icao']] for a in old_airports] +
+                  [results[icao] for icao in sorted(new_icaos) if icao in results]
+              ),
+              'routes': build_routes(old_routes, results, new_icaos - set(unavailable_new)),
           }
           new_bytes = (json.dumps(updated, ensure_ascii=False, separators=(',', ':'), allow_nan=False) + '\n').encode('utf-8')
           archive_dir = Path('snapshots')
@@ -305,7 +351,7 @@ jobs:
           )
           PREV.write_bytes(original_bytes)
           SNAP.write_bytes(new_bytes)
-          print(f'Ready: {len(results)} airports, {len(updated["routes"])} routes. Archived: {len(manifest["snapshots"])}. Stale airports: {sorted(stale)}', flush=True)
+          print(f'Ready: {len(results)} airports, {len(updated["routes"])} routes. Archived: {len(manifest["snapshots"])}. Stale airports: {sorted(stale)}. Unavailable new airports: {sorted(unavailable_new)}', flush=True)
           PY
 
       - name: Commit

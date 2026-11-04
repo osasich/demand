@@ -1,0 +1,66 @@
+# Additional ICAO airports for NewSky traffic.B collection.
+# These are merged with the airport list already present in snapshot.json.
+# Unsupported airports are retried on later runs.
+
+# Slovakia
+LZIB LZKZ LZTT LZPP LZZI LZSL LZTN LZNI LZMA LZPE LZSV LZLU
+
+# Moldova
+LUKK LUBL LUBM
+
+# Slovenia
+LJLJ LJPZ LJMB LJBL LJBO LJCE
+
+# Romania
+LRTR LRIA LRBS LRCK LRSV LRBC LRSB LROD LRPW LRCN LRTC
+
+# Poland
+EPRZ EPLL EPLB EPSC EPBY EPBC EPBK EPBA
+
+# Czech Republic
+LKTB LKMT LKKV LKBE LKCB LKVO
+
+# Austria
+LOWG LOWL LOWK
+
+# Hungary
+LHDC LHSM
+
+# Bulgaria
+LBBG LBPD
+
+# Bosnia and Herzegovina
+LQSA LQBK LQTZ
+
+# Montenegro
+LYPG LYTV
+
+# Croatia
+LDDU LDSP LDZD LDPL LDRI LDLO LDOC LDPN
+
+# Greece
+LGRP LGIR LGKO LGKR LGSR LGSA LGSK
+
+# Spain
+GCTS GCLP GCXO LEGE LEMH
+
+# Portugal
+LPMA LPPD
+
+# Turkey
+LTBS LTFE LTFG LTCG LTBA
+
+# Germany
+EDDV EDDW EDLW EDJA EDSB
+
+# United Kingdom
+EGPF EGNT EGGP EGLC
+
+# Georgia
+UGKO UGSB
+
+# Lithuania
+EYKA EYPA
+
+# Ukraine
+UKLC UKCK UKKT UKDB UKHD
